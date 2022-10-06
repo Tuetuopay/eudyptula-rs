@@ -8,4 +8,5 @@
 *.rmeta
 Module.symvers
 modules.order
+debian-11-nocloud-amd64.qcow2
 rust-project.json
