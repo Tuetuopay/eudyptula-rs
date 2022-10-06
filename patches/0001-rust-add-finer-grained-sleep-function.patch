@@ -1,0 +1,60 @@
+From b90c62c488acab92f65f6d3917d0dc42d69bebf0 Mon Sep 17 00:00:00 2001
+From: Tuetuopay <tuetuopay@me.com>
+Date: Thu, 6 Oct 2022 21:38:43 +0200
+Subject: [PATCH] rust: add finer-grained sleep() function
+
+This sleep function handles down to microseconds delays thanks to udelay.
+---
+ rust/kernel/delay.rs | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+diff --git a/rust/kernel/delay.rs b/rust/kernel/delay.rs
+index 1e987fa65..ab506dea0 100644
+--- a/rust/kernel/delay.rs
++++ b/rust/kernel/delay.rs
+@@ -56,6 +56,42 @@ pub fn coarse_sleep(duration: Duration) {
+     unsafe { bindings::msleep(coarse_sleep_conversion(duration)) }
+ }
+ 
++const MICROS_PER_SEC: u64 = 1_000_000;
++
++fn micro_sleep_conversion(duration: Duration) -> core::ffi::c_ulong {
++    // Unstable library feature
++    // let micro_as_nanos = Duration::MICROSECOND.subsec_nanos();
++    let micro_as_nanos = 1_000;
++
++    // Rounds the nanoseconds of `duration` up to the nearest microsecond.
++    let nanos_as_micros = duration.subsec_nanos().wrapping_add(micro_as_nanos - 1) / micro_as_nanos;
++
++    // Saturates the second component of `duration` to `c_uint::MAX`.
++    let seconds_as_micros = min(
++        duration.as_secs().saturating_mul(MICROS_PER_SEC),
++        u64::from(core::ffi::c_ulong::MAX),
++    ) as core::ffi::c_ulong;
++
++    seconds_as_micros.saturating_add(nanos_as_micros as core::ffi::c_ulong)
++}
++
++/// Sleeps safely even with waitqueue interruptions.
++///
++/// This function forwards the call to the C side `usleep_range` or `msleep` functions. As a result,
++/// `duration` will be rounded up to the nearest microsecond if granularity less than a microsecond
++/// is provided; and any [`Duration`] that exceeds [`c_uint::MAX`][core::ffi::c_uint::MAX] in
++/// microseconds is staurated.
++pub fn sleep(duration: Duration) {
++    if duration.as_millis() < 20 {
++        let usecs = micro_sleep_conversion(duration);
++        // SAFETY: `usleep_range_state` is safe for all values of its arguments.
++        unsafe { bindings::usleep_range_state(usecs, usecs * 2, bindings::TASK_UNINTERRUPTIBLE) }
++    } else {
++        // SAFETY: `msleep` is safe for all values of its arguments.
++        unsafe { bindings::msleep(coarse_sleep_conversion(duration)) }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{coarse_sleep_conversion, MILLIS_PER_SEC};
+-- 
+2.37.3
+
