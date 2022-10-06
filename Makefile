@@ -1,5 +1,6 @@
 KDIR ?= /lib/modules/`uname -r`/build
 ARCH ?= x86_64
+EXTRAVERSION ?= -eudyptula-rs
 
 ARCH_DEBIAN = $(ARCH:x86_64=amd64)
 
@@ -8,20 +9,20 @@ TASKS = $(wildcard task*/task*.rs)
 all: $(TASKS:%.rs=%.ko)
 
 %.ko: %.rs
-	$(MAKE) -C $(KDIR) M=$$PWD/$(shell dirname $*)
+	$(MAKE) -C $(KDIR) EXTRAVERSION=$(EXTRAVERSION) M=$$PWD/$(shell dirname $*)
 
 clean:
 	$(RM) */Module.symvers */modules.order
 	$(RM) */*.mod */*.mod.c */*.mod.o */*.o */*.ko
 
 rust-project.json:
-	$(MAKE) -C $(KDIR) rust-analyzer
+	$(MAKE) -C $(KDIR) EXTRAVERSION=$(EXTRAVERSION) rust-analyzer
 
 debian-11-nocloud-$(ARCH_DEBIAN).qcow2:
 	wget https://cloud.debian.org/images/cloud/bullseye/latest/$@
 
 $(KDIR)/arch/$(ARCH)/boot/bzImage:
-	$(MAKE) -C $(KDIR)
+	$(MAKE) -C $(KDIR) EXTRAVERSION=$(EXTRAVERSION)
 
 # Mount the P9 share by appending the following to /etc/fstab:
 # eudyptula-rs /root/eudyptula-rs 9p trans=virtio,ro,version=9p2000.L 0 0
