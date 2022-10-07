@@ -34,6 +34,7 @@ vm: debian-11-nocloud-$(ARCH_DEBIAN).qcow2 $(KDIR)/arch/$(ARCH)/boot/bzImage
 		-drive file=debian-11-nocloud-$(ARCH_DEBIAN).qcow2,if=virtio \
 		-device virtio-net,netdev=net0 \
 		-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
-		-virtfs local,path=$$PWD,mount_tag=eudyptula-rs,security_model=mapped-xattr
+		-virtfs local,path=$$PWD,mount_tag=eudyptula-rs,security_model=mapped-xattr \
+		-usb -device usb-kbd,bus=usb-bus.0
 
 .PHONY: clean vm

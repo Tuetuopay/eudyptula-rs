@@ -1,0 +1,510 @@
+From 6950f54b660aa396d92efb72909cb2d35974cf2b Mon Sep 17 00:00:00 2001
+From: Tuetuopay <tuetuopay@me.com>
+Date: Fri, 7 Oct 2022 14:11:04 +0200
+Subject: [PATCH] rust: add usb drivers bindings
+
+---
+ rust/bindings/bindings_helper.h |   1 +
+ rust/helpers.c                  |  16 ++
+ rust/kernel/lib.rs              |   1 +
+ rust/kernel/usb.rs              | 430 ++++++++++++++++++++++++++++++++
+ 4 files changed, 448 insertions(+)
+ create mode 100644 rust/kernel/usb.rs
+
+diff --git a/rust/bindings/bindings_helper.h b/rust/bindings/bindings_helper.h
+index 284793085..637d5eea0 100644
+--- a/rust/bindings/bindings_helper.h
++++ b/rust/bindings/bindings_helper.h
+@@ -36,6 +36,7 @@
+ #include <linux/sysctl.h>
+ #include <linux/uaccess.h>
+ #include <linux/uio.h>
++#include <linux/usb.h>
+ #include <uapi/linux/android/binder.h>
+ 
+ /* `bindgen` gets confused at certain things. */
+diff --git a/rust/helpers.c b/rust/helpers.c
+index bf790f46c..047513a17 100644
+--- a/rust/helpers.c
++++ b/rust/helpers.c
+@@ -39,6 +39,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/uaccess.h>
+ #include <linux/uio.h>
++#include <linux/usb.h>
+ 
+ __noreturn void rust_helper_BUG(void)
+ {
+@@ -377,6 +378,21 @@ rust_helper_platform_set_drvdata(struct platform_device *pdev,
+ }
+ EXPORT_SYMBOL_GPL(rust_helper_platform_set_drvdata);
+ 
++void *
++rust_helper_usb_get_intfdata(struct usb_interface *intf)
++{
++	return usb_get_intfdata(intf);
++}
++EXPORT_SYMBOL_GPL(rust_helper_usb_get_intfdata);
++
++void
++rust_helper_usb_set_intfdata(struct usb_interface *intf,
++			     void *data)
++{
++	usb_set_intfdata(intf, data);
++}
++EXPORT_SYMBOL_GPL(rust_helper_usb_set_intfdata);
++
+ refcount_t rust_helper_REFCOUNT_INIT(int n)
+ {
+ 	return (refcount_t)REFCOUNT_INIT(n);
+diff --git a/rust/kernel/lib.rs b/rust/kernel/lib.rs
+index 6a322effa..166824219 100644
+--- a/rust/kernel/lib.rs
++++ b/rust/kernel/lib.rs
+@@ -69,6 +69,7 @@ pub mod revocable;
+ pub mod security;
+ pub mod str;
+ pub mod task;
++pub mod usb;
+ pub mod workqueue;
+ 
+ pub mod linked_list;
+diff --git a/rust/kernel/usb.rs b/rust/kernel/usb.rs
+new file mode 100644
+index 000000000..5e5a16d23
+--- /dev/null
++++ b/rust/kernel/usb.rs
+@@ -0,0 +1,430 @@
++// SPDX-License-Identifier: GPL-2.0
++
++//! USB driver.
++//!
++//! C header: [`include/linux/usb.h`](../../include/linux/usb.h)
++
++use crate::{
++    device, driver,
++    error::{from_kernel_result, Result},
++    str::CStr,
++    to_result, PointerWrapper, ThisModule,
++};
++
++/// A registration of an USB driver.
++pub type Registration<T> = driver::Registration<Adapter<T>>;
++
++/// An adapter for the registration of USB drivers.
++pub struct Adapter<T: Driver>(T);
++
++impl<T: Driver> driver::DriverOps for Adapter<T> {
++    type RegType = bindings::usb_driver;
++
++    unsafe fn register(
++        reg: *mut bindings::usb_driver,
++        name: &'static CStr,
++        module: &'static ThisModule,
++    ) -> Result {
++        // SAFETY: By the safety requirements of this function (defined in the trait definition),
++        // `reg` is non-null and valid.
++        let pdrv = unsafe { &mut *reg };
++
++        pdrv.name = name.as_char_ptr();
++        pdrv.probe = Some(Self::probe_callback);
++        pdrv.disconnect = Some(Self::disconnect_callback);
++
++        // SAFETY:
++        //   - `pdrv` lives at least until the call to `usb_deregister()` returns.
++        //   - `name` pointer has static lifetime.
++        //   - `module.0` lives at least as long as the module.
++        //   - `probe()` and `disconnect()` are static functions.
++        to_result(unsafe { bindings::usb_register_driver(reg, module.0, name.as_char_ptr()) })
++    }
++
++    unsafe fn unregister(reg: *mut bindings::usb_driver) {
++        // SAFETY: By the safety requirements of this function (defined in the trait definition),
++        // `reg` was passed (and updated) by a previous successful call to
++        // `usb_register_driver`.
++        unsafe { bindings::usb_deregister(reg) };
++    }
++}
++
++impl<T: Driver> Adapter<T> {
++    extern "C" fn probe_callback(
++        piface: *mut bindings::usb_interface,
++        pid: *const bindings::usb_device_id,
++    ) -> core::ffi::c_int {
++        from_kernel_result! {
++            // SAFETY: both `piface` and `pid` are valid by the contract with the C code. `iface`
++            // and `id` are alive only for the duration of this call, so they are guaranteed to
++            // remain alive for the lifetime of `pdev`.
++            let mut iface = unsafe { Interface::from_ptr(piface) };
++            let id = unsafe { DeviceId::from_ptr(pid) };
++            let data = T::probe(&mut iface, &id)?;
++            // SAFETY: `piface` is guaranteed to be a valid, non-null pointer.
++            unsafe { bindings::usb_set_intfdata(piface, data.into_pointer() as _) };
++            Ok(0)
++        }
++    }
++
++    extern "C" fn disconnect_callback(piface: *mut bindings::usb_interface) {
++        // SAFETY: `piface` is valid by the contract with the C code.
++        let ptr = unsafe { bindings::usb_get_intfdata(piface) };
++        // SAFETY:
++        //   - we allocated this pointer using `T::Data::into_pointer`,
++        //     so it is safe to turn it back into a `T::Data`.
++        //   - the allocation happened in `probe`, no-one freed the memory,
++        //     `disconnect` is the canonical kernel location to free driver data.
++        //     So OK to convert the pointer back to a Rust structure here.
++        let data = unsafe { T::Data::from_pointer(ptr) };
++        T::disconnect(&data);
++        <T::Data as driver::DeviceRemoval>::device_remove(&data);
++    }
++}
++
++/// An USB driver.
++pub trait Driver {
++    /// Data stored on device by driver.
++    ///
++    /// Corresponds to the data set or retrieved via the kernel's `usb_{set,get}_intfdata`
++    /// functions.
++    ///
++    /// Require that `Data` implements `PointerWrapper`. We guarantee to never move the underlying
++    /// wrapped data structure.
++    type Data: PointerWrapper + Send + Sync + driver::DeviceRemoval = ();
++
++    /// USB driver probe.
++    ///
++    /// Called to see if the driver is willing to manage a particular interface on a device.
++    /// If it is, `probe` returns data to associate with the interface.
++    /// If unwilling to manage the interface, return [`ENODEV`], if genuine IO errors occurred, an
++    /// appropriate error.
++    fn probe(iface: &mut Interface, device_id: &DeviceId) -> Result<Self::Data>;
++
++    /// USB driver disconnect.
++    ///
++    /// Called when the interface is no longer accessible, usually because its device has been (or
++    /// is being) disconnected or the driver module is being unloaded.
++    fn disconnect(_data: &Self::Data) {}
++}
++
++/// An USB interface.
++///
++/// # Invariants
++///
++/// The field `ptr` is non-null and valid for the lifetime of the object.
++pub struct Interface {
++    ptr: *mut bindings::usb_interface,
++}
++
++impl Interface {
++    /// Creates a new interface from the given pointer.
++    ///
++    /// # Safety
++    ///
++    /// `ptr` must be non-null and valid. It must remain valid for the lifetime of the returned
++    /// instance.
++    unsafe fn from_ptr(ptr: *mut bindings::usb_interface) -> Self {
++        // INVARIANT: The safety requirements of the function ensure the lifetime invariant.
++        Self { ptr }
++    }
++}
++
++// SAFETY: The device returned by `raw_device` is the raw USB device.
++unsafe impl device::RawDevice for Interface {
++    fn raw_device(&self) -> *mut bindings::device {
++        // SAFETY: By the type invariants, we know that `self.ptr` is non-null and valid.
++        unsafe { &mut (*self.ptr).dev }
++    }
++}
++
++/// An USB device ID.
++///
++/// # Invariants
++///
++/// The field `ptr` is non-null and valid for the lifetime of the object.
++#[derive(Clone, Copy)]
++pub struct DeviceId {
++    pub vendor: u16,
++    pub product: u16,
++    pub device_version_low: u16,
++    pub device_version_high: u16,
++    pub device_class: u8,
++    pub device_sub_class: u8,
++    pub device_protocol: u8,
++    pub interface_class: u8,
++    pub interface_sub_class: u8,
++    pub interface_protocol: u8,
++    pub interface_number: u8,
++    flags: u16,
++}
++
++impl DeviceId {
++    pub const fn default() -> Self {
++        Self {
++            vendor: 0,
++            product: 0,
++            device_version_low: 0,
++            device_version_high: 0,
++            device_class: 0,
++            device_sub_class: 0,
++            device_protocol: 0,
++            interface_class: 0,
++            interface_sub_class: 0,
++            interface_protocol: 0,
++            interface_number: 0,
++            flags: 0,
++        }
++    }
++
++    pub const fn device(vendor: u16, product: u16) -> Self {
++        Self {
++            flags: bindings::USB_DEVICE_ID_MATCH_DEVICE as u16,
++            vendor,
++            product,
++            ..Self::default()
++        }
++    }
++
++    pub const fn version_low(self, low: u16) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_DEV_LO as u16,
++            device_version_low: low,
++            ..self
++        }
++    }
++
++    pub const fn version_high(self, high: u16) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_DEV_HI as u16,
++            device_version_high: high,
++            ..self
++        }
++    }
++
++    pub const fn version(self, low: u16, high: u16) -> Self {
++        self.version_low(low).version_high(high)
++    }
++
++    pub const fn interface_class(self, class: IfClass) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_INT_CLASS as u16,
++            interface_class: class as u8,
++            ..self
++        }
++    }
++
++    pub const fn interface_subclass(self, subclass: IfSubClass) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_INT_SUBCLASS as u16,
++            interface_sub_class: subclass as u8,
++            ..self
++        }
++    }
++
++    pub const fn interface_proto(self, proto: IfProto) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_INT_PROTOCOL as u16,
++            interface_protocol: proto as u8,
++            ..self
++        }
++    }
++
++    pub const fn interface_number(self, num: u8) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_INT_NUMBER as u16,
++            interface_number: num,
++            ..self
++        }
++    }
++
++    pub const fn interface_info(
++        class: IfClass,
++        subclass: IfSubClass,
++        proto: IfProto,
++    ) -> Self {
++        Self {
++            flags: bindings::USB_DEVICE_ID_MATCH_INT_INFO as u16,
++            interface_class: class as u8,
++            interface_sub_class: subclass as u8,
++            interface_protocol: proto as u8,
++            ..Self::default()
++        }
++    }
++
++    pub const fn device_info(class: u8, subclass: u8, proto: u8) -> Self {
++        Self {
++            flags: bindings::USB_DEVICE_ID_MATCH_DEV_INFO as u16,
++            device_class: class,
++            device_sub_class: subclass,
++            device_protocol: proto,
++            ..Self::default()
++        }
++    }
++
++    pub const fn vendor(self, vendor: u16) -> Self {
++        Self {
++            flags: self.flags | bindings::USB_DEVICE_ID_MATCH_VENDOR as u16,
++            vendor,
++            ..self
++        }
++    }
++
++    /// Creates a new device ID from the given pointer.
++    ///
++    /// # Safety
++    ///
++    /// `ptr` must be non-null and valid.
++    unsafe fn from_ptr(ptr: *const bindings::usb_device_id) -> Self {
++        // INVARIANT: The safety requirements of the function ensure the lifetime invariant.
++        let id = unsafe { &*ptr };
++        let flags = id.match_flags;
++
++        Self {
++            flags,
++            vendor: id.idVendor,
++            product: id.idProduct,
++            device_version_low: id.bcdDevice_lo,
++            device_version_high: id.bcdDevice_hi,
++            device_class: id.bDeviceClass,
++            device_sub_class: id.bDeviceSubClass,
++            device_protocol: id.bDeviceProtocol,
++            interface_class: id.bInterfaceClass,
++            interface_sub_class: id.bInterfaceSubClass,
++            interface_protocol: id.bInterfaceProtocol,
++            interface_number: id.bInterfaceNumber,
++        }
++    }
++}
++
++/// An USB interface class.
++#[derive(Clone, Copy, Debug)]
++#[repr(u8)]
++pub enum IfClass {
++    /// HID interface.
++    ///
++    /// Found in [`include/uapi/linux/hid.h`].
++    Hid = 0x03,
++    /// CCID interface.
++    ///
++    /// Found in [`include/linux/usb/ccid.h`].
++    Ccid = 0x0b,
++}
++
++/// An USB interface subclass.
++#[derive(Clone, Copy, Debug)]
++#[repr(u8)]
++pub enum IfSubClass {
++    /// HID Boot subclass.
++    ///
++    /// Found in [`include/uapi/linux/hid.h`].
++    HidBoot = 0x01,
++}
++
++/// An USB interface protocol.
++#[derive(Clone, Copy, Debug)]
++#[repr(u8)]
++pub enum IfProto {
++    /// HID Keyboard
++    ///
++    /// Found in [`include/uapi/linux/hid.h`].
++    HidKeyboard = 0x01,
++    /// HID Mouse
++    ///
++    /// Found in [`include/uapi/linux/hid.h`].
++    HidMouse = 0x02,
++}
++
++// SAFETY: `ZERO` is all zeroed-out and `to_rawid` stores `offset` in
++// `usb_device_id::driver_info`.
++unsafe impl const driver::RawDeviceId for DeviceId {
++    type RawType = bindings::usb_device_id;
++    const ZERO: Self::RawType = bindings::usb_device_id {
++        match_flags: 0,
++        idVendor: 0,
++        idProduct: 0,
++        bcdDevice_lo: 0,
++        bcdDevice_hi: 0,
++        bDeviceClass: 0,
++        bDeviceSubClass: 0,
++        bDeviceProtocol: 0,
++        bInterfaceClass: 0,
++        bInterfaceSubClass: 0,
++        bInterfaceProtocol: 0,
++        bInterfaceNumber: 0,
++        driver_info: 0,
++    };
++
++    fn to_rawid(&self, offset: isize) -> Self::RawType {
++        let mut id = Self::ZERO;
++        id.match_flags = self.flags;
++        id.idVendor = self.vendor;
++        id.idProduct = self.product;
++        id.bcdDevice_lo = self.device_version_low;
++        id.bcdDevice_hi = self.device_version_high;
++        id.bDeviceClass = self.device_class;
++        id.bDeviceSubClass = self.device_sub_class;
++        id.bDeviceProtocol = self.device_protocol;
++        id.bInterfaceClass = self.interface_class;
++        id.bInterfaceSubClass = self.interface_sub_class;
++        id.bInterfaceProtocol = self.interface_protocol;
++        id.bInterfaceNumber = self.interface_number;
++        id.driver_info = offset as bindings::kernel_ulong_t;
++        id
++    }
++}
++
++/// Defines a const USB device id table that also carries per-entry data/context/info.
++///
++/// The name of the const is `USB_DEVICE_ID_TABLE`, which is what modules are expected to name
++/// their USB tables.
++///
++/// # Examples
++///
++/// ```
++/// # use kernel::define_usb_id_table;
++/// use kernel::usb;
++///
++/// define_usb_id_table! {u32, [
++///     (usb::DeviceId::device(0x0b49, 0x064f), Some(0x69)),
++/// ]}
++/// ```
++#[macro_export]
++macro_rules! define_usb_id_table {
++    ($data_type:ty, $($t:tt)*) => {
++        $crate::define_id_table!(USB_DEVICE_ID_TABLE, $crate::usb::DeviceId, $data_type, $($t)*);
++    }
++}
++
++/// Declares a kernel module that exposes a single USB driver.
++///
++/// # Examples
++///
++/// ```ignore
++/// # use kernel::{usb, define_usb_id_table, module_usb_driver};
++/// #
++/// struct MyDriver;
++/// impl usb::Driver for MyDriver {
++///     // [...]
++/// #   fn probe(_dev: &mut usb::Device, device_id: &usb::DeviceId) -> Result {
++/// #       Ok(())
++/// #   }
++/// }
++///
++/// module_usb_driver! {
++///     type: MyDriver,
++///     name: "usb_name",
++///     author: "Author Name",
++///     license: "GPL",
++/// }
++///
++/// define_usb_id_table! {(), [
++///     (usb::DeviceId::device(0x0b49, 0x064f)),
++/// ]}
++/// ```
++#[macro_export]
++macro_rules! module_usb_driver {
++    ($($f:tt)*) => {
++        $crate::module_driver!(<T>, $crate::usb::Adapter<T>, { $($f)* });
++    }
++}
+-- 
+2.37.3
+
