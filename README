@@ -3,6 +3,52 @@ My solutions to Eudyptula challenges, in Rust.
 With the recent merge of Rust in the Linux Kernel, why not do the challenge, but
 in Rust?
 
+This is written against the Rust For Linux kernel repository, *not* the mainline
+kernel. It currently lacks too many interfaces and bindings to be usable further
+than something like task 01. And from a certain point, it even requires
+additional bindings that can be found in my own version of the kernel.
+
+Dev setup
+---------
+
+Kernel
+======
+
+Clone RFL somewhere. This location will be described as `$RFL_PATH` further. For
+some tasks, you'll need the `rust` branch from
+`https://github.com/Tuetuopay/linux`, or to apply manually the patches provided
+in the task's folder. Base yourself from a distro's config, and enable Rust
+support. If you plan on using the VM provided by the makefile, then use a Debian
+11 config. Then build an appropriate `bzImage`:
+
+    make KDIR=$RFL_PATH LLVM=1 $RFL_PATH/arch/x86_64/boot/bzImage
+
+Copy it wherever needed, e.g. to the VM using the provided P9 share.
+
+Building tasks
+==============
+
+The makefile exposes generic targets to build a `.ko` from a corresponding `.rs`
+from the same directory, or the default target to build all tasks:
+
+    make KDIR=$RFL_PATH LLVM=1 task01/task01.ko
+
+Testing modules
+===============
+
+A Debian 11 VM is provided with the makefile using the `vm` target. It will
+download a Debian 11 VM image if absent, and boot the vm off it. It will use the
+kernel image built earlier. It will start with no GUI, only the main TTY in
+stdin/out.
+
+    make KDIR=$RFL_PATH LLVM=1 vm
+
+A P9 filesystem share is setup to share the whole project directory to the VM to
+give it access to the built `.ko`s. Mount it by appending the following to
+fstab:
+
+    eudyptula-rs /root/eudyptula-rs 9p trans=virtio,ro,version=9p2000.L 0 0
+
 Tasks:
 
 This is Task 01 of the Eudyptula Challenge
